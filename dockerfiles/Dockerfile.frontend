@@ -1,0 +1,77 @@
+# Multi-stage build for Next.js frontend.
+# Stage 1: Install all dependencies (including devDependencies for build)
+# Stage 2: Build the Next.js application
+# Stage 3: Production-only image (no dev deps, minimal attack surface)
+#
+# Result: ~200MB image vs ~1GB without multi-stage
+
+# ─── Stage 1: Dependency installer ───────────────────────────────────────────
+# Separate layer for package installation so it's cached unless package.json changes.
+FROM node:20-alpine AS deps
+
+# Install OS-level build dependencies for native modules (e.g. bcrypt, sharp)
+RUN apk add --no-cache libc6-compat
+
+WORKDIR /app
+
+# Copy ONLY package files first — this layer is cached unless packages change
+# (most frequent change is source code, not packages)
+COPY package.json package-lock.json* ./
+
+# Install production dependencies ONLY for the runtime stage
+# --frozen-lockfile: fail if lock file is out of sync (ensures reproducibility)
+RUN npm ci --frozen-lockfile --ignore-scripts
+
+# ─── Stage 2: Builder ─────────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy deps from previous stage
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy source code (this layer changes on every commit)
+COPY . .
+
+# Build arguments for Next.js public env vars (baked in at build time)
+ARG NEXT_PUBLIC_API_URL=https://api.example.com
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+ENV NODE_ENV=production
+
+# Build the Next.js application
+# Output: .next/standalone contains a self-contained server
+RUN npm run build
+
+# ─── Stage 3: Production runner ───────────────────────────────────────────────
+FROM node:20-alpine AS runner
+
+# Security: create a non-root user for running the application
+# Prevents privilege escalation if the container is compromised
+RUN addgroup --system --gid 1001 nodejs \
+ && adduser  --system --uid 1001 nextjs
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV PORT=3000
+# Disable Next.js telemetry
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Copy only what is needed to run (not the full node_modules or source)
+# next/standalone is a self-contained output with minimal dependencies
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+
+# Switch to non-root user
+USER nextjs
+
+EXPOSE 3000
+
+# Health check: Docker/Swarm will mark container unhealthy if this fails
+# --fail makes wget exit non-zero on HTTP errors
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+  CMD wget -qO- http://localhost:3000/api/health || exit 1
+
+# Use the standalone output server (not `next start` which needs full install)
+CMD ["node", "server.js"]
