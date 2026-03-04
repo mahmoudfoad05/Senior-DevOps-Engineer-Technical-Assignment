@@ -1,6 +1,6 @@
 ###############################################################################
 # Production-Ready Docker Swarm Stack
-# Author: Senior DevOps Engineer Assignment
+# Author: Mahmoud
 # Description: Full-stack microservices deployment with Traefik, PostgreSQL,
 #              Redis, monitoring, and proper secret management.
 ###############################################################################
@@ -242,7 +242,6 @@ services:
 
   # ---------------------------------------------------------------------------
   # BACKEND API — Node.js / Express
-  # Detailed inline annotations as required by Task 1.2.
   # ---------------------------------------------------------------------------
   backend:
     image: ghcr.io/yourorg/backend:${BACKEND_TAG:-latest}
