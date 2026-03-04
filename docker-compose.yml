@@ -1,0 +1,591 @@
+###############################################################################
+# Production-Ready Docker Swarm Stack
+# Author: Senior DevOps Engineer Assignment
+# Description: Full-stack microservices deployment with Traefik, PostgreSQL,
+#              Redis, monitoring, and proper secret management.
+###############################################################################
+
+version: "3.9"
+
+###############################################################################
+# SECRETS
+# All sensitive data is stored as Swarm secrets — never as plain env vars.
+# Secrets are stored encrypted in the Raft log and only decrypted in-memory
+# inside the container at /run/secrets/<secret-name>.
+###############################################################################
+secrets:
+  db_password:
+    external: true          # Created via: echo "strongpassword" | docker secret create db_password -
+  db_username:
+    external: true          # Created via: echo "appuser" | docker secret create db_username -
+  db_connection_string:
+    external: true          # Full DSN; avoids reconstructing it from parts
+  redis_password:
+    external: true
+  jwt_secret:
+    external: true          # Application-level JWT signing key
+
+###############################################################################
+# CONFIGS
+# Non-sensitive configuration files (e.g. nginx.conf, prometheus.yml) are
+# stored as Swarm configs — versioned and rolled without container rebuilds.
+###############################################################################
+configs:
+  nginx_config:
+    external: true          # Created via: docker config create nginx_config ./nginx.conf
+  app_config:
+    external: true          # Application runtime config (feature flags, etc.)
+
+###############################################################################
+# VOLUMES
+# Named volumes are managed by the Swarm and survive container restarts.
+# For production, use a shared volume driver (e.g. NFS, Longhorn) so
+# replicas on different nodes share the same data.
+###############################################################################
+volumes:
+  postgres_data:
+    driver: local           # Replace with shared driver in multi-node prod
+  redis_data:
+    driver: local
+  grafana_data:
+    driver: local
+  prometheus_data:
+    driver: local
+
+###############################################################################
+# NETWORKS
+# Four-tier isolation model:
+#   public       → ingress only (Traefik)
+#   frontend_net → Traefik ↔ frontend service
+#   backend_net  → frontend ↔ backend, backend ↔ DB/Redis
+#   monitoring   → Prometheus ↔ all exporters
+#
+# Encrypted overlays (driver_opts: encrypted: "true") prevent eavesdropping
+# between Swarm nodes on untrusted networks.
+###############################################################################
+networks:
+  public:
+    driver: overlay
+    attachable: true        # Allows standalone containers to join for debugging
+    driver_opts:
+      encrypted: "true"
+
+  frontend_net:
+    driver: overlay
+    attachable: false       # No ad-hoc containers; tighten the surface area
+    driver_opts:
+      encrypted: "true"
+
+  backend_net:
+    driver: overlay
+    attachable: false
+    driver_opts:
+      encrypted: "true"
+
+  monitoring:
+    driver: overlay
+    attachable: true
+    driver_opts:
+      encrypted: "true"
+
+###############################################################################
+# SERVICES
+###############################################################################
+services:
+
+  # ---------------------------------------------------------------------------
+  # TRAEFIK — Reverse Proxy & SSL Termination
+  # Runs globally on manager nodes and watches Swarm service labels for
+  # dynamic routing rules.  Let's Encrypt issues certificates automatically.
+  # ---------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=false"                         # Dashboard only via secure route
+      - "--providers.swarm=true"                       # Enable Swarm provider
+      - "--providers.swarm.exposedbydefault=false"     # Opt-in per service
+      - "--providers.swarm.network=public"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=ops@example.com"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      - "--metrics.prometheus=true"                   # Expose /metrics for Prometheus
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host            # host mode avoids IPVS hairpinning; better for real IPs
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"   # Read-only; Traefik needs to list services
+      - "traefik_certs:/letsencrypt"
+    networks:
+      - public
+      - monitoring
+    deploy:
+      mode: global            # One instance per manager; ensures HA
+      placement:
+        constraints:
+          - node.role == manager
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+        order: stop-first     # Stop old, start new (safer for port binds)
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      labels:
+        # Expose Traefik dashboard behind BasicAuth
+        - "traefik.enable=true"
+        - "traefik.http.routers.dashboard.rule=Host(`traefik.example.com`)"
+        - "traefik.http.routers.dashboard.service=api@internal"
+        - "traefik.http.routers.dashboard.middlewares=auth"
+        - "traefik.http.middlewares.auth.basicauth.users=admin:$$apr1$$xyz$$hashedpassword"
+        - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+        - "traefik.http.services.traefik-svc.loadbalancer.server.port=8080"
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  # ---------------------------------------------------------------------------
+  # FRONTEND — Next.js Application
+  # Multiple replicas for HA; rolling updates with zero downtime.
+  # ---------------------------------------------------------------------------
+  frontend:
+    image: ghcr.io/yourorg/frontend:${FRONTEND_TAG:-latest}
+    # Build context omitted in Swarm mode — images must be pre-built and pushed
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=https://api.example.com
+    networks:
+      - public
+      - frontend_net
+    configs:
+      - source: app_config
+        target: /app/config/runtime.json
+        uid: "1001"
+        gid: "1001"
+        mode: 0440
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s       # Give Next.js time to build pages on startup
+    deploy:
+      mode: replicated
+      replicas: 3             # Minimum for HA; scale per load
+      update_config:
+        parallelism: 1        # One replica at a time → zero-downtime rolling update
+        delay: 15s            # Wait for health check to pass before next replica
+        failure_action: rollback
+        monitor: 60s          # Observe for 60s before marking update successful
+        max_failure_ratio: 0.3
+        order: start-first    # Start new, then stop old (requires extra capacity)
+      rollback_config:
+        parallelism: 2
+        delay: 5s
+        failure_action: pause  # Pause and alert ops if rollback itself fails
+        monitor: 30s
+        order: stop-first
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+      placement:
+        preferences:
+          - spread: node.labels.zone  # Spread across AZs if node labels are set
+        constraints:
+          - node.role == worker       # Don't co-locate with Swarm managers
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 256M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.frontend.rule=Host(`example.com`) && PathPrefix(`/`)"
+        - "traefik.http.routers.frontend.entrypoints=websecure"
+        - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
+        - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+        - "traefik.http.services.frontend.loadbalancer.healthcheck.path=/api/health"
+        - "traefik.http.services.frontend.loadbalancer.healthcheck.interval=10s"
+        # Security headers middleware
+        - "traefik.http.middlewares.secheaders.headers.stsSeconds=31536000"
+        - "traefik.http.middlewares.secheaders.headers.stsIncludeSubdomains=true"
+        - "traefik.http.middlewares.secheaders.headers.contentTypeNosniff=true"
+        - "traefik.http.middlewares.secheaders.headers.xssProtection=1"
+        - "traefik.http.routers.frontend.middlewares=secheaders"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # BACKEND API — Node.js / Express
+  # Detailed inline annotations as required by Task 1.2.
+  # ---------------------------------------------------------------------------
+  backend:
+    image: ghcr.io/yourorg/backend:${BACKEND_TAG:-latest}
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      # DB credentials come from secrets, NOT env vars
+      - DB_SECRET_FILE=/run/secrets/db_connection_string
+      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
+      - JWT_SECRET_FILE=/run/secrets/jwt_secret
+    secrets:
+      - db_connection_string   # Full PostgreSQL DSN
+      - db_password
+      - db_username
+      - redis_password
+      - jwt_secret
+    networks:
+      - frontend_net           # Receives requests from frontend / Traefik
+      - backend_net            # Connects to Postgres and Redis
+      - monitoring             # Exposes /metrics to Prometheus
+    healthcheck:
+      # Use wget (busybox) or curl based on your base image
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      # --- Replicated mode: explicit replica count ---
+      mode: replicated
+      replicas: 3
+
+      # --- Update strategy ---
+      # parallelism 2: update 2 replicas simultaneously (faster than 1, safer than all-at-once)
+      # delay 10s: wait 10s between each batch — allows LB to drain connections
+      # failure_action rollback: if a task fails during update, auto-revert ALL tasks
+      # monitor 60s: Swarm monitors task health for 60s before declaring success
+      # order start-first: ensures capacity is maintained during update
+      update_config:
+        parallelism: 2
+        delay: 10s
+        failure_action: rollback
+        monitor: 60s
+        max_failure_ratio: 0.2
+        order: start-first
+
+      # --- Rollback strategy ---
+      # Triggered automatically by failure_action: rollback above, OR manually via
+      # `docker service rollback <service-name>`
+      rollback_config:
+        parallelism: 2
+        delay: 5s
+        failure_action: pause   # Don't loop; alert ops on double-failure
+        monitor: 30s
+        order: stop-first
+
+      # --- Placement ---
+      # preferences.spread distributes replicas across labeled zones/nodes evenly
+      # constraints.worker ensures managers stay free for Swarm control-plane work
+      placement:
+        preferences:
+          - spread: node.labels.zone
+        constraints:
+          - node.role == worker
+          - node.labels.app == backend   # Optional: dedicated backend nodes
+
+      # --- Resource management ---
+      # limits: hard ceiling — container killed if exceeded (OOM kill for memory)
+      # reservations: guaranteed floor — Swarm scheduler won't place task on a
+      #               node without at least this much free capacity
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+
+      labels:
+        - "traefik.enable=true"
+        # Path-based routing: /api/* → backend
+        - "traefik.http.routers.backend.rule=Host(`example.com`) && PathPrefix(`/api`)"
+        - "traefik.http.routers.backend.entrypoints=websecure"
+        - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
+        - "traefik.http.services.backend.loadbalancer.server.port=4000"
+        # Sticky sessions: ensures same client always hits same backend replica
+        - "traefik.http.services.backend.loadbalancer.sticky.cookie=true"
+        - "traefik.http.services.backend.loadbalancer.sticky.cookie.name=backend_session"
+        - "traefik.http.services.backend.loadbalancer.sticky.cookie.secure=true"
+        - "traefik.http.services.backend.loadbalancer.sticky.cookie.httpOnly=true"
+        # Rate limiting: protect API from abuse
+        - "traefik.http.middlewares.ratelimit.ratelimit.average=100"
+        - "traefik.http.middlewares.ratelimit.ratelimit.burst=200"
+        - "traefik.http.routers.backend.middlewares=ratelimit,secheaders"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        labels: "service=backend"
+
+  # ---------------------------------------------------------------------------
+  # POSTGRESQL — Primary Database
+  # Single replica with volume persistence. For true HA, use Patroni or an
+  # external managed DB (RDS, Cloud SQL).
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: appdb
+      # Read credentials from Swarm secrets at runtime
+      POSTGRES_USER_FILE: /run/secrets/db_username
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_username
+      - db_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$(cat /run/secrets/db_username) -d appdb"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      mode: replicated
+      replicas: 1             # Single writer; HA needs external tooling
+      placement:
+        constraints:
+          - node.labels.postgres == "true"   # Pin to a node with fast storage
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # REDIS — Session Store & Cache
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    command: >
+      sh -c "redis-server
+        --requirepass $$(cat /run/secrets/redis_password)
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --appendonly yes
+        --appendfsync everysec"
+    secrets:
+      - redis_password
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "$$(cat /run/secrets/redis_password)", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.cache == "true"
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+
+  # ---------------------------------------------------------------------------
+  # PROMETHEUS — Metrics Collection
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"         # Allow hot-reload via HTTP POST
+    volumes:
+      - prometheus_data:/prometheus
+    configs:
+      - source: prometheus_config
+        target: /etc/prometheus/prometheus.yml
+    networks:
+      - monitoring
+      - public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+        reservations:
+          cpus: "0.1"
+          memory: 256M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.prometheus.rule=Host(`prometheus.example.com`)"
+        - "traefik.http.routers.prometheus.entrypoints=websecure"
+        - "traefik.http.routers.prometheus.tls.certresolver=letsencrypt"
+        - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+
+  # ---------------------------------------------------------------------------
+  # GRAFANA — Dashboards
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/grafana_admin_password
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+      - GF_SERVER_ROOT_URL=https://grafana.example.com
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    secrets:
+      - grafana_admin_password
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - monitoring
+      - public
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.grafana.rule=Host(`grafana.example.com`)"
+        - "traefik.http.routers.grafana.entrypoints=websecure"
+        - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+        - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  # ---------------------------------------------------------------------------
+  # NODE EXPORTER — Host Metrics (global = one per node)
+  # ---------------------------------------------------------------------------
+  node_exporter:
+    image: prom/node-exporter:v1.7.0
+    command:
+      - "--path.rootfs=/host"
+      - "--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - monitoring
+    deploy:
+      mode: global            # Automatically deployed to every node in the Swarm
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 128M
+
+  # ---------------------------------------------------------------------------
+  # cADVISOR — Container Metrics (global)
+  # ---------------------------------------------------------------------------
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks:
+      - monitoring
+    deploy:
+      mode: global
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # ALERTMANAGER
+  # ---------------------------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    configs:
+      - source: alertmanager_config
+        target: /etc/alertmanager/alertmanager.yml
+    networks:
+      - monitoring
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+# Extra volumes referenced above
+volumes:
+  traefik_certs:
+    driver: local
+  grafana_admin_password:  # referenced as secret, not a volume — corrected below
+
+secrets:
+  grafana_admin_password:
+    external: true
+  prometheus_config:
+    external: false           # Inline config; see monitoring/prometheus.yml
+  alertmanager_config:
+    external: false
