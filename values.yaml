@@ -1,0 +1,164 @@
+# values.yaml — Task 6.2: Helm Chart Conversion
+# Default values for the app Helm chart.
+# Override per-environment: helm install app . -f values.prod.yaml
+
+# ─── Global ──────────────────────────────────────────────────────────────────
+global:
+  imageRegistry: "ghcr.io/yourorg"
+  imageTag: "latest"
+  environment: "production"
+  domain: "example.com"
+
+# ─── Frontend ─────────────────────────────────────────────────────────────────
+frontend:
+  enabled: true
+  image:
+    repository: frontend
+    tag: ""              # Overrides global.imageTag if set
+    pullPolicy: IfNotPresent
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  service:
+    type: ClusterIP
+    port: 3000
+  ingress:
+    enabled: true
+    className: "traefik"
+    annotations:
+      traefik.ingress.kubernetes.io/router.entrypoints: websecure
+      traefik.ingress.kubernetes.io/router.tls.certresolver: letsencrypt
+    hosts:
+      - host: "example.com"
+        paths:
+          - path: /
+            pathType: Prefix
+  livenessProbe:
+    httpGet:
+      path: /api/health
+      port: 3000
+    initialDelaySeconds: 30
+    periodSeconds: 30
+  readinessProbe:
+    httpGet:
+      path: /api/health
+      port: 3000
+    initialDelaySeconds: 10
+    periodSeconds: 15
+
+# ─── Backend ──────────────────────────────────────────────────────────────────
+backend:
+  enabled: true
+  image:
+    repository: backend
+    tag: ""
+    pullPolicy: IfNotPresent
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 60
+  service:
+    type: ClusterIP
+    port: 4000
+  ingress:
+    enabled: true
+    className: "traefik"
+    hosts:
+      - host: "example.com"
+        paths:
+          - path: /api
+            pathType: Prefix
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 4000
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 4000
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    failureThreshold: 3
+  env:
+    NODE_ENV: production
+    PORT: "4000"
+  # Reference K8s secrets (created separately or via Sealed Secrets)
+  secretEnvs:
+    - name: DATABASE_URL
+      secretName: db-credentials
+      secretKey: connection-string
+    - name: REDIS_PASSWORD
+      secretName: redis-credentials
+      secretKey: password
+    - name: JWT_SECRET
+      secretName: app-secrets
+      secretKey: jwt-secret
+
+# ─── PostgreSQL ───────────────────────────────────────────────────────────────
+postgresql:
+  enabled: true
+  # Using Bitnami PostgreSQL subchart (add as dependency)
+  auth:
+    existingSecret: db-credentials  # K8s secret name
+    secretKeys:
+      adminPasswordKey: postgres-password
+      userPasswordKey: password
+      replicationPasswordKey: replication-password
+  primary:
+    persistence:
+      enabled: true
+      size: 20Gi
+      storageClass: "fast-ssd"    # Use your cluster's storage class
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+
+# ─── Redis ────────────────────────────────────────────────────────────────────
+redis:
+  enabled: true
+  auth:
+    existingSecret: redis-credentials
+    existingSecretPasswordKey: password
+  master:
+    persistence:
+      enabled: true
+      size: 5Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# ─── Monitoring ───────────────────────────────────────────────────────────────
+monitoring:
+  serviceMonitor:
+    enabled: true      # Requires Prometheus Operator CRD
+    interval: 15s

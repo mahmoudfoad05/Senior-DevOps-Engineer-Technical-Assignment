@@ -1,0 +1,203 @@
+# alerts/swarm.yml — Task 4.3: Alerting Rules
+# Prometheus alerting rules for Docker Swarm production deployments.
+# These rules cover the scenarios specified in Task 4.3.
+
+groups:
+
+  # ─── Service Health ─────────────────────────────────────────────────────────
+  - name: swarm_service_health
+    interval: 30s
+    rules:
+
+      # Alert when a service has fewer running replicas than desired
+      # Formula: compare running tasks to the desired replica count per service
+      - alert: SwarmServiceReplicasMissing
+        expr: |
+          (
+            sum by (service_name) (
+              label_replace(
+                container_tasks_state{state="running"},
+                "service_name", "$1", "container_label_com_docker_swarm_service_name", "(.+)"
+              )
+            )
+          )
+          <
+          (
+            sum by (service_name) (
+              label_replace(
+                container_tasks_state,
+                "service_name", "$1", "container_label_com_docker_swarm_service_name", "(.+)"
+              )
+            ) * on(service_name) group_left
+            swarm_service_desired_replicas
+          )
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Service {{ $labels.service_name }} has missing replicas"
+          description: >
+            Service {{ $labels.service_name }} has {{ $value }} running replicas,
+            fewer than the desired count. Investigate with:
+            docker service ps {{ $labels.service_name }} --no-trunc
+
+      # Simpler replica check using Swarm API metrics
+      - alert: SwarmServiceDown
+        expr: |
+          swarm_service_running_replicas < swarm_service_desired_replicas
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Swarm service {{ $labels.name }} degraded"
+          description: "{{ $labels.name }}: {{ $value }} of {{ $labels.desired }} replicas running"
+
+      # Alert if a service has ZERO running tasks (complete outage)
+      - alert: SwarmServiceCompleteOutage
+        expr: swarm_service_running_replicas == 0
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: "CRITICAL: Service {{ $labels.name }} has 0 running replicas"
+          description: "Complete outage for {{ $labels.name }}. Immediate action required."
+
+  # ─── Node Health ─────────────────────────────────────────────────────────────
+  - name: swarm_node_health
+    rules:
+
+      # Alert when a Swarm node becomes unreachable
+      - alert: SwarmNodeDown
+        expr: swarm_node_state{state!="ready"} == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Swarm node {{ $labels.name }} is {{ $labels.state }}"
+          description: >
+            Node {{ $labels.name }} ({{ $labels.role }}) is not in 'ready' state.
+            Check: docker node ls && docker node inspect {{ $labels.name }}
+
+      # Alert on manager quorum risk (need majority of managers healthy)
+      - alert: SwarmManagerQuorumAtRisk
+        expr: |
+          (count(swarm_node_manager{reachability="reachable"}) / count(swarm_node_manager)) < 0.6
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Swarm manager quorum at risk"
+          description: "Less than 60% of manager nodes are reachable. Raft consensus may fail."
+
+  # ─── Memory Usage ────────────────────────────────────────────────────────────
+  - name: resource_usage
+    rules:
+
+      - alert: ContainerHighMemoryUsage
+        expr: |
+          (container_memory_working_set_bytes{name!=""} / container_spec_memory_limit_bytes{name!=""}) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} memory > 90%"
+          description: >
+            Container {{ $labels.name }} on {{ $labels.instance }} is using
+            {{ $value | humanizePercentage }} of its memory limit.
+
+      - alert: NodeHighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.node }} memory > 90%"
+          description: "Node {{ $labels.node }} memory usage is {{ $value }}%"
+
+      - alert: NodeHighCPUUsage
+        expr: |
+          100 - (avg by(node) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU on node {{ $labels.node }}"
+          description: "Node {{ $labels.node }} CPU usage: {{ $value }}%"
+
+      - alert: NodeDiskSpaceLow
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk space on {{ $labels.node }}"
+          description: "Only {{ $value }}% disk space remaining on {{ $labels.node }}"
+
+  # ─── API Performance ─────────────────────────────────────────────────────────
+  - name: api_performance
+    rules:
+
+      # Backend API response time P99 exceeding threshold
+      - alert: BackendAPIHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{job="backend"}[5m])) by (le, route)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend API P99 latency > 2s on route {{ $labels.route }}"
+          description: "P99 latency is {{ $value }}s for {{ $labels.route }}"
+
+      # High error rate on backend API
+      - alert: BackendAPIHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="backend",status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="backend"}[5m]))
+          > 0.05
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend API error rate > 5%"
+          description: "Current error rate: {{ $value | humanizePercentage }}"
+
+  # ─── Database ────────────────────────────────────────────────────────────────
+  - name: database_health
+    rules:
+
+      - alert: PostgresConnectionFailure
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is unreachable"
+          description: "Postgres exporter cannot connect to the database"
+
+      - alert: PostgresConnectionPoolNearCapacity
+        expr: |
+          pg_stat_database_numbackends{datname="appdb"}
+          /
+          pg_settings_max_connections
+          > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connection pool > 80% capacity"
+          description: "{{ $value | humanizePercentage }} of max connections in use"
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is unreachable"
+          description: "Redis exporter reports redis_up=0"

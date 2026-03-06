@@ -1,0 +1,87 @@
+# alertmanager.yml — Task 4.3
+# Routes alerts to the right team via Slack and PagerDuty.
+# Inhibition rules prevent alert storms during incidents.
+
+global:
+  resolve_timeout: 5m
+  slack_api_url: "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+
+# ─── Templates ────────────────────────────────────────────────────────────────
+templates:
+  - "/etc/alertmanager/templates/*.tmpl"
+
+# ─── Routing Tree ─────────────────────────────────────────────────────────────
+# Alerts flow from root → first matching child route.
+route:
+  receiver: "slack-platform"
+  group_by: ["alertname", "cluster", "service_name"]
+  group_wait:      30s   # Wait to batch alerts from the same group
+  group_interval:  5m    # How often to re-notify about ongoing groups
+  repeat_interval: 4h    # How often to re-notify if still firing
+
+  routes:
+    # Page on-call for critical/page severity
+    - match_re:
+        severity: "critical|page"
+      receiver: "pagerduty-oncall"
+      continue: true        # Also send to Slack
+
+    # All alerts go to platform Slack channel
+    - match:
+        team: platform
+      receiver: "slack-platform"
+
+    # Database alerts to DB team
+    - match_re:
+        alertname: "Postgres.*|Redis.*"
+      receiver: "slack-database"
+
+# ─── Receivers ────────────────────────────────────────────────────────────────
+receivers:
+
+  - name: "slack-platform"
+    slack_configs:
+      - channel: "#platform-alerts"
+        send_resolved: true
+        title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Severity:* {{ .Labels.severity }}
+          *Details:* {{ .Annotations.description }}
+          {{ end }}
+        color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+
+  - name: "slack-database"
+    slack_configs:
+      - channel: "#database-alerts"
+        send_resolved: true
+        title: '[{{ .Status | toUpper }}] DB Alert: {{ .GroupLabels.alertname }}'
+
+  - name: "pagerduty-oncall"
+    pagerduty_configs:
+      - routing_key: "YOUR_PAGERDUTY_INTEGRATION_KEY"
+        description: "{{ .GroupLabels.alertname }}: {{ .CommonAnnotations.summary }}"
+        severity: '{{ if eq (index .Alerts 0).Labels.severity "page" }}critical{{ else }}error{{ end }}'
+        details:
+          cluster:     "{{ .CommonLabels.cluster }}"
+          environment: "{{ .CommonLabels.environment }}"
+
+# ─── Inhibition Rules ─────────────────────────────────────────────────────────
+# Suppress lower-priority alerts when a higher-priority one is firing for the
+# same service — prevents alert storms during major incidents.
+inhibit_rules:
+
+  # If a service is completely down, suppress replica-count warnings for it
+  - source_match:
+      alertname: SwarmServiceCompleteOutage
+    target_match_re:
+      alertname: "SwarmServiceReplicasMissing|SwarmServiceDown"
+    equal: ["service_name"]
+
+  # If a node is down, suppress container-level alerts on that node
+  - source_match:
+      alertname: SwarmNodeDown
+    target_match_re:
+      alertname: "ContainerHighMemoryUsage|BackendAPIHighLatency"
+    equal: ["node"]

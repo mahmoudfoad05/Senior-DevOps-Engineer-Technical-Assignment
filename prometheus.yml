@@ -1,0 +1,175 @@
+# prometheus.yml — Task 4.1
+# Prometheus configuration with Docker Swarm service discovery.
+# Services opt in to scraping by setting these labels in their deploy.labels:
+#   prometheus.scrape=true
+#   prometheus.port=<metrics-port>       (optional; defaults to task port)
+#   prometheus.path=<metrics-path>       (optional; defaults to /metrics)
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
+  external_labels:
+    cluster: "prod-swarm"
+    environment: "production"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+      timeout: 10s
+
+rule_files:
+  - "/etc/prometheus/alerts/*.yml"
+
+scrape_configs:
+
+  # --------------------------------------------------------------------------
+  # Prometheus self-monitoring
+  # --------------------------------------------------------------------------
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # --------------------------------------------------------------------------
+  # Docker Swarm dynamic service discovery
+  #
+  # How it works:
+  #   1. dockerswarm_sd_configs polls the Swarm API for running tasks.
+  #   2. Each task generates a target with metadata labels.
+  #   3. relabel_configs filter (keep/drop) and rename those labels.
+  #
+  # Only tasks with label  prometheus.scrape=true  are kept.
+  # --------------------------------------------------------------------------
+  - job_name: "swarm-services"
+    dockerswarm_sd_configs:
+      - host: "unix:///var/run/docker.sock"
+        role: tasks
+        refresh_interval: 15s
+
+    relabel_configs:
+      # Keep only tasks explicitly opted-in for scraping
+      - source_labels: [__meta_dockerswarm_service_label_prometheus_scrape]
+        regex: "true"
+        action: keep
+
+      # Keep only running tasks (not pending/shutdown/failed)
+      - source_labels: [__meta_dockerswarm_task_desired_state]
+        regex: "running"
+        action: keep
+
+      # Step 1: Copy the task IP into a temporary label
+      - source_labels: [__meta_dockerswarm_task_address]
+        target_label: __tmp_task_ip
+
+      # Step 2: If a custom metrics port label is set, build address from IP + label port.
+      #         Without this rule __address__ defaults to task IP:task port.
+      - source_labels: [__tmp_task_ip, __meta_dockerswarm_service_label_prometheus_port]
+        regex: "(.+);(.+)"
+        separator: ";"
+        replacement: "${1}:${2}"
+        target_label: __address__
+
+      # Use a custom metrics path if specified
+      - source_labels: [__meta_dockerswarm_service_label_prometheus_path]
+        regex: "(.+)"
+        target_label: __metrics_path__
+
+      # Set job label from service name
+      - source_labels: [__meta_dockerswarm_service_name]
+        target_label: job
+
+      # Preserve service name as a metric label for dashboards
+      - source_labels: [__meta_dockerswarm_service_name]
+        target_label: service_name
+
+      # Preserve the node hostname for per-node drill-down
+      - source_labels: [__meta_dockerswarm_node_hostname]
+        target_label: node
+
+      # Drop the temporary label (not needed in final metric)
+      - regex: "__tmp_.*"
+        action: labeldrop
+
+  # --------------------------------------------------------------------------
+  # Node Exporter — one global task per node, port 9100
+  # --------------------------------------------------------------------------
+  - job_name: "node-exporter"
+    dockerswarm_sd_configs:
+      - host: "unix:///var/run/docker.sock"
+        role: tasks
+        refresh_interval: 15s
+
+    relabel_configs:
+      # Only scrape the node_exporter service
+      - source_labels: [__meta_dockerswarm_service_name]
+        regex: ".*node.exporter.*"
+        action: keep
+
+      # Only running tasks
+      - source_labels: [__meta_dockerswarm_task_desired_state]
+        regex: "running"
+        action: keep
+
+      # Build address: task IP + :9100
+      # __meta_dockerswarm_task_address contains only the IP (no port)
+      - source_labels: [__meta_dockerswarm_task_address]
+        regex: "(.*)"
+        replacement: "${1}:9100"
+        target_label: __address__
+
+      # Label with the physical node hostname for per-node dashboards
+      - source_labels: [__meta_dockerswarm_node_hostname]
+        target_label: node
+
+  # --------------------------------------------------------------------------
+  # cAdvisor — one global task per node, port 8080
+  # --------------------------------------------------------------------------
+  - job_name: "cadvisor"
+    dockerswarm_sd_configs:
+      - host: "unix:///var/run/docker.sock"
+        role: tasks
+        refresh_interval: 15s
+
+    relabel_configs:
+      - source_labels: [__meta_dockerswarm_service_name]
+        regex: ".*cadvisor.*"
+        action: keep
+
+      - source_labels: [__meta_dockerswarm_task_desired_state]
+        regex: "running"
+        action: keep
+
+      - source_labels: [__meta_dockerswarm_task_address]
+        regex: "(.*)"
+        replacement: "${1}:8080"
+        target_label: __address__
+
+      - source_labels: [__meta_dockerswarm_node_hostname]
+        target_label: node
+
+  # --------------------------------------------------------------------------
+  # Traefik — built-in metrics on port 8080
+  # --------------------------------------------------------------------------
+  - job_name: "traefik"
+    dockerswarm_sd_configs:
+      - host: "unix:///var/run/docker.sock"
+        role: tasks
+        refresh_interval: 15s
+
+    relabel_configs:
+      - source_labels: [__meta_dockerswarm_service_name]
+        regex: ".*traefik.*"
+        action: keep
+
+      - source_labels: [__meta_dockerswarm_task_desired_state]
+        regex: "running"
+        action: keep
+
+      - source_labels: [__meta_dockerswarm_task_address]
+        regex: "(.*)"
+        replacement: "${1}:8080"
+        target_label: __address__
+
+      - source_labels: [__meta_dockerswarm_node_hostname]
+        target_label: node

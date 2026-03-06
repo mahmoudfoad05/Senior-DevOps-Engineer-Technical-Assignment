@@ -1,0 +1,153 @@
+{{/* templates/backend-deployment.yaml — Task 6.2 */}}
+{{- if .Values.backend.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "app.fullname" . }}-backend
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  {{- if not .Values.backend.autoscaling.enabled }}
+  replicas: {{ .Values.backend.replicaCount }}
+  {{- end }}
+
+  # Rolling update strategy — equivalent to Swarm update_config
+  # maxUnavailable: how many pods can be unavailable during update (like parallelism)
+  # maxSurge: how many EXTRA pods can be created above desired count (like start-first)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0    # Never go below desired replicas (zero-downtime)
+      maxSurge: 1          # Allow 1 extra pod during update
+
+  # progressDeadlineSeconds: if rollout doesn't complete in this time, it's marked Failed
+  # This triggers automatic rollback when combined with a Flux/ArgoCD health check
+  progressDeadlineSeconds: 300
+
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: backend
+
+  template:
+    metadata:
+      labels:
+        {{- include "app.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: backend
+      annotations:
+        # Force pod restart when ConfigMap changes (checksum trick)
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+
+    spec:
+      # Graceful termination: allow 30s for in-flight requests to complete
+      terminationGracePeriodSeconds: 30
+
+      # Pod anti-affinity: spread replicas across nodes (Swarm equivalent: placement preference spread)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/component
+                      operator: In
+                      values: [backend]
+                topologyKey: kubernetes.io/hostname  # One replica per node preferred
+
+      # Security context: run as non-root (Swarm equivalent: USER in Dockerfile)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+
+      containers:
+        - name: backend
+          image: "{{ .Values.global.imageRegistry }}/{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag | default .Values.global.imageTag }}"
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.backend.service.port }}
+              protocol: TCP
+
+          env:
+            {{- range $k, $v := .Values.backend.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            # Inject secrets as env vars from K8s Secrets
+            {{- range .Values.backend.secretEnvs }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .secretKey }}
+            {{- end }}
+
+          # livenessProbe: if this fails repeatedly, RESTART the container
+          # (Swarm equivalent: healthcheck + restart_policy)
+          livenessProbe:
+            {{- toYaml .Values.backend.livenessProbe | nindent 12 }}
+
+          # readinessProbe: if this fails, REMOVE from Service endpoints (stop sending traffic)
+          # K8s ONLY concept — Swarm had no equivalent, making it harder to handle
+          # graceful startup and temporary unavailability
+          readinessProbe:
+            {{- toYaml .Values.backend.readinessProbe | nindent 12 }}
+
+          # startupProbe: gives slow-starting containers time before liveness kicks in
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 10
+
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+
+          # Mount ConfigMap as volume (Swarm equivalent: config)
+          volumeMounts:
+            - name: app-config
+              mountPath: /app/config
+              readOnly: true
+
+      volumes:
+        - name: app-config
+          configMap:
+            name: {{ include "app.fullname" . }}-config
+
+---
+# Horizontal Pod Autoscaler — Swarm has no equivalent (requires manual service update)
+{{- if .Values.backend.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "app.fullname" . }}-backend
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "app.fullname" . }}-backend
+  minReplicas: {{ .Values.backend.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.backend.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.backend.autoscaling.targetCPUUtilizationPercentage }}
+    # Custom metric: scale on HTTP request rate (requires Prometheus Adapter)
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "100"
+{{- end }}
+{{- end }}

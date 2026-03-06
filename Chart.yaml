@@ -1,0 +1,28 @@
+# Chart.yaml — Helm chart metadata (required by Helm)
+apiVersion: v2
+name: app
+description: >
+  Production microservices stack — Next.js frontend, Node.js/Express API,
+  PostgreSQL, Redis. Kubernetes equivalent of the Docker Swarm stack.
+type: application
+version: 0.1.0         # Chart version (increment on chart changes)
+appVersion: "1.0.0"    # Application version (updated by CI/CD on release)
+home: https://github.com/yourorg/devops-assignment
+maintainers:
+  - name: Platform Team
+    email: platform@example.com
+keywords:
+  - nextjs
+  - nodejs
+  - postgres
+  - redis
+dependencies:
+  # Bitnami charts provide production-ready PostgreSQL and Redis with HA support
+  - name: postgresql
+    version: "14.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: postgresql.enabled
+  - name: redis
+    version: "18.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: redis.enabled

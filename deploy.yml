@@ -1,0 +1,331 @@
+# .github/workflows/deploy.yml — Task 7.1
+# CI/CD: build → scan → push → deploy to Swarm via Portainer API
+#
+# Flow:
+#   PR/feature branches : build + security scan only (no push/deploy)
+#   develop branch      : build + scan + push + auto-deploy to staging
+#   main branch         : build + scan + push + auto-deploy staging
+#                         → manual approval gate → deploy to production
+#   workflow_dispatch   : manual trigger with rollback option
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, "release/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, production]
+      rollback:
+        description: "Rollback to previous version?"
+        type: boolean
+        default: false
+
+# Prevent concurrent deploys to the same ref; never cancel in-flight deploys
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+jobs:
+
+  # ─── 1. Build & Push Frontend ─────────────────────────────────────────────
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Separate metadata step per image so tags reference the correct image name
+      - name: Docker metadata (frontend)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/frontend
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: dockerfiles/Dockerfile.frontend
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+          platforms: linux/amd64,linux/arm64
+          provenance: true
+
+  # ─── 2. Build & Push Backend ──────────────────────────────────────────────
+  build-backend:
+    name: Build Backend
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (backend)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/backend
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: dockerfiles/Dockerfile.backend
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+          platforms: linux/amd64,linux/arm64
+          provenance: true
+
+  # ─── 3. Security Scanning ─────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    needs: [build-frontend, build-backend]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      security-events: write   # required to upload SARIF results
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy scan — frontend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/frontend:sha-${{ github.sha }}
+          format: sarif
+          output: trivy-frontend.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Trivy scan — backend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/backend:sha-${{ github.sha }}
+          format: sarif
+          output: trivy-backend.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload frontend scan to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-frontend.sarif
+
+      - name: Upload backend scan to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-backend.sarif
+
+      - name: Lint Dockerfiles
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: dockerfiles/Dockerfile.frontend
+
+  # ─── 4. Deploy to Staging ─────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-frontend, build-backend, security-scan]
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.example.com
+    if: |
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') &&
+      github.event_name != 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Staging via Portainer API
+        env:
+          PORTAINER_URL: ${{ secrets.STAGING_PORTAINER_URL }}
+          PORTAINER_TOKEN: ${{ secrets.STAGING_PORTAINER_TOKEN }}
+        run: |
+          IMAGE_TAG="sha-$(echo '${{ github.sha }}' | head -c7)"
+          python3 scripts/portainer_deploy.py deploy \
+            --stack app-staging \
+            --compose docker-compose.yml \
+            --env "FRONTEND_TAG=${IMAGE_TAG}" \
+                  "BACKEND_TAG=${IMAGE_TAG}" \
+                  "ENVIRONMENT=staging" \
+            --wait
+
+      - name: Staging smoke tests
+        run: |
+          sleep 30
+          curl -sf --retry 5 --retry-delay 5 https://staging.example.com/api/health | python3 -m json.tool
+          curl -sf https://staging.example.com/ > /dev/null
+          echo "Staging smoke tests passed"
+
+      - name: Notify Slack — staging deployed
+        if: success()
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "✅ *Staging* deployed: `sha-${{ github.sha }}`\n${{ github.event.head_commit.message }}",
+              "channel": "#deployments"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ─── 5. Deploy to Production (manual approval gate) ──────────────────────
+  deploy-production:
+    name: Deploy to Production
+    needs: [build-frontend, build-backend, deploy-staging]
+    runs-on: ubuntu-latest
+    environment:
+      name: production         # Requires a reviewer approval in GitHub Environments
+      url: https://example.com
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Record current version BEFORE update so we can mention it in the rollback alert
+      - name: Record pre-deploy version
+        env:
+          PORTAINER_URL: ${{ secrets.PROD_PORTAINER_URL }}
+          PORTAINER_TOKEN: ${{ secrets.PROD_PORTAINER_TOKEN }}
+        run: |
+          PREV=$(python3 scripts/portainer_deploy.py status --stack app-production \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); \
+              print(next((e['value'] for e in d.get('Env',[]) if e['name']=='FRONTEND_TAG'),'unknown'))")
+          echo "PREVIOUS_TAG=${PREV}" >> "$GITHUB_ENV"
+
+      - name: Deploy to Production via Portainer API
+        env:
+          PORTAINER_URL: ${{ secrets.PROD_PORTAINER_URL }}
+          PORTAINER_TOKEN: ${{ secrets.PROD_PORTAINER_TOKEN }}
+        run: |
+          IMAGE_TAG="sha-$(echo '${{ github.sha }}' | head -c7)"
+          python3 scripts/portainer_deploy.py deploy \
+            --stack app-production \
+            --compose docker-compose.yml \
+            --env "FRONTEND_TAG=${IMAGE_TAG}" \
+                  "BACKEND_TAG=${IMAGE_TAG}" \
+                  "ENVIRONMENT=production" \
+            --wait
+
+      - name: Production smoke tests
+        run: |
+          sleep 30
+          curl -sf --retry 5 --retry-delay 5 https://example.com/api/health | python3 -m json.tool
+          curl -sf https://example.com/ > /dev/null
+          echo "Production smoke tests passed"
+
+      - name: Notify Slack — production deployed
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "🚀 *Production* deployed by ${{ github.actor }}: `sha-${{ github.sha }}` (was `${{ env.PREVIOUS_TAG }}`)",
+              "channel": "#deployments"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack — production FAILED
+        if: failure()
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "❌ *Production deploy FAILED* for `sha-${{ github.sha }}`. Run rollback workflow immediately.",
+              "channel": "#deployments"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ─── 6. Rollback Production ───────────────────────────────────────────────
+  rollback-production:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.rollback == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rollback via docker service rollback (Swarm built-in)
+        # This uses the Swarm's own rollback mechanism which reverts to the
+        # previous task spec (image + config) atomically and in parallel.
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+              "${{ secrets.PROD_SWARM_USER }}@${{ secrets.PROD_SWARM_HOST }}" \
+              "docker service rollback app-production_frontend && \
+               docker service rollback app-production_backend"
+
+      - name: Notify Slack — rollback executed
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ *Production ROLLED BACK* by ${{ github.actor }}",
+              "channel": "#deployments"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
