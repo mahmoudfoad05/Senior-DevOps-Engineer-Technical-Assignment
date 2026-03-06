@@ -1,0 +1,82 @@
+# Dockerfile.backend — Task 7.2
+# Multi-stage build for Node.js/TypeScript Express API.
+#
+# Stages:
+#   base       — shared Alpine base with dumb-init
+#   prod-deps  — production-only node_modules (no devDependencies)
+#   build      — full deps + TypeScript compilation → dist/
+#   runner     — minimal production image (dist/ + prod node_modules only)
+#
+# Result: ~120 MB image vs ~800 MB without multi-stage builds.
+
+# ─── Stage 1: Shared base ─────────────────────────────────────────────────────
+FROM node:20-alpine AS base
+WORKDIR /app
+
+# dumb-init handles PID 1 responsibilities in containers:
+#   - Reaps zombie processes
+#   - Forwards SIGTERM/SIGINT to child processes correctly
+#   - Ensures graceful shutdown propagates to Node.js
+RUN apk add --no-cache dumb-init
+
+# ─── Stage 2: Production dependencies ────────────────────────────────────────
+FROM base AS prod-deps
+WORKDIR /app
+
+# Copy package manifests first — this layer is only rebuilt when packages change,
+# not on every source code commit (Docker layer cache optimization).
+COPY package.json package-lock.json* ./
+
+# --omit=dev: exclude devDependencies (TypeScript, jest, etc.) from this image.
+# --frozen-lockfile: fail if lockfile is stale (ensures reproducible builds).
+RUN npm ci --frozen-lockfile --omit=dev && npm cache clean --force
+
+# ─── Stage 3: Build (TypeScript → JavaScript) ─────────────────────────────────
+FROM base AS build
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+# Install ALL dependencies (need TypeScript compiler, type definitions, etc.)
+RUN npm ci --frozen-lockfile
+
+# Copy TypeScript config — use glob to gracefully handle JS-only projects
+COPY tsconfig*.json ./
+# Copy source tree
+COPY src/ ./src/
+# Compile TypeScript to dist/ (adjust script name if needed: "compile", "tsc", etc.)
+RUN npm run build
+
+# ─── Stage 4: Production runner ───────────────────────────────────────────────
+FROM base AS runner
+
+# Security: create a non-root user. Running as root in a container means any
+# container escape immediately grants root on the host.
+RUN addgroup --system --gid 1001 nodejs \
+ && adduser  --system --uid 1001 --ingroup nodejs nodeapp
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV PORT=4000
+
+# Copy compiled output only (no TypeScript source code in production image)
+COPY --from=build     --chown=nodeapp:nodejs /app/dist ./dist
+
+# Copy production node_modules (no devDependencies)
+COPY --from=prod-deps --chown=nodeapp:nodejs /app/node_modules ./node_modules
+
+# Copy package.json (some libraries read the version field at runtime)
+COPY --chown=nodeapp:nodejs package.json ./
+
+USER nodeapp
+
+EXPOSE 4000
+
+# Health check: Swarm uses this to decide if a task is healthy during rolling
+# updates. start-period gives Node.js time to initialize DB connections, etc.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+  CMD wget -qO- http://localhost:4000/health || exit 1
+
+# dumb-init as PID 1; node as the actual process
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "dist/index.js"]
